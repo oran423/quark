@@ -628,14 +628,30 @@ class Quark:
         ).json()
         return response
 
-    def rename(self, fid, file_name):
+    def rename(self, fid, file_name, retry=3):
+        """优化重命名方法，增加重试机制"""
+        # 过滤非法字符（夸克网盘不支持的字符）
+        illegal_chars = r'[\\/:*?"<>|]'
+        file_name = re.sub(illegal_chars, "_", file_name)
+        
         url = f"{self.BASE_URL}/1/clouddrive/file/rename"
         querystring = {"pr": "ucpro", "fr": "pc", "uc_param_str": ""}
         payload = {"fid": fid, "file_name": file_name}
-        response = self._send_request(
-            "POST", url, json=payload, params=querystring
-        ).json()
-        return response
+        
+        for i in range(retry):
+            try:
+                response = self._send_request(
+                    "POST", url, json=payload, params=querystring
+                ).json()
+                if response["code"] == 0:
+                    return response
+                else:
+                    print(f"重命名重试 {i+1}/{retry} 失败: {response['message']}")
+                    time.sleep(1)
+            except Exception as e:
+                print(f"重命名重试 {i+1}/{retry} 异常: {str(e)}")
+                time.sleep(1)
+        return {"code": -1, "message": "重命名失败（已重试3次）"}
 
     def delete(self, filelist):
         url = f"{self.BASE_URL}/1/clouddrive/file/delete"
@@ -796,7 +812,11 @@ class Quark:
 
         updated_tree = self.dir_check_and_save(task, pwd_id, stoken, pdir_fid)
         if updated_tree.size(1) > 0:
-            self.do_rename(updated_tree)
+            # 先执行重命名，再更新集数记录
+            rename_success = self.do_rename(updated_tree)
+            if rename_success:
+                # 重命名成功后更新集数记录
+                self.update_episode_records(task, updated_tree)
             print()
             add_notify(f"✅《{task['taskname']}》添加追更：\n{updated_tree}")
             return updated_tree
@@ -839,7 +859,7 @@ class Quark:
         tree.create_node(
             savepath,
             pdir_fid,
-            data={"is_dir": True}
+            data={"is_dir": True, "new_fid": to_pdir_fid}  # 存储转存后的目录fid
         )
 
         # 文件命名类
@@ -855,7 +875,6 @@ class Quark:
         task_name = task["taskname"]
         if task_name not in CONFIG_DATA["saved_records"]:
             CONFIG_DATA["saved_records"][task_name] = {}
-        episode_records = CONFIG_DATA["saved_records"][task_name]  # 格式：{ "S01": "山河枕 - S01E13.mkv" }
 
         # 需保存的文件清单
         need_save_list = []
@@ -878,7 +897,7 @@ class Quark:
                         continue
                     
                     # 检查是否已存在更高级别的集数
-                    current_record = episode_records.get(season)
+                    current_record = CONFIG_DATA["saved_records"][task_name].get(season)
                     current_ep = 0
                     if current_record:
                         # 从当前记录中提取集数数字
@@ -909,60 +928,51 @@ class Quark:
         # 转存文件
         fid_list = [item["fid"] for item in need_save_list]
         fid_token_list = [item["share_fid_token"] for item in need_save_list]
-        save_as_top_fids = []
+        save_as_top_fids = []  # 存储转存后的新fid
         if fid_list:
             err_msg = None
+            # 临时存储分次转存的结果，保证顺序
+            temp_save_fids = []
             while fid_list:
                 # 分次转存，100个/次
+                batch_fids = fid_list[:100]
+                batch_tokens = fid_token_list[:100]
                 save_file_return = self.save_file(
-                    fid_list[:100], fid_token_list[:100], to_pdir_fid, pwd_id, stoken
+                    batch_fids, batch_tokens, to_pdir_fid, pwd_id, stoken
                 )
                 fid_list = fid_list[100:]
                 fid_token_list = fid_token_list[100:]
+                
                 if save_file_return["code"] == 0:
                     # 转存成功，查询转存结果
                     task_id = save_file_return["data"]["task_id"]
                     query_task_return = self.query_task(task_id)
                     if query_task_return["code"] == 0:
-                        save_as_top_fids.extend(
-                            query_task_return["data"]["save_as"]["save_as_top_fids"]
-                        )
-                    else:
-                        err_msg = query_task_return["message"]
+                        # 记录本次转存的新fid
+                        batch_new_fids = query_task_return["data"]["save_as"]["save_as_top_fids"]
+                        temp_save_fids.extend(batch_new_fids)
+                        save_as_top_fids.extend(batch_new_fids)
                 else:
                     err_msg = save_file_return["message"]
+                
                 if err_msg:
                     add_notify(f"❌《{task['taskname']}》转存失败：{err_msg}\n")
-        
-        # 转存成功后更新集数记录（存储完整文件名）- 修复：按集数升序更新，确保最新集数被保存
-        if save_as_top_fids:
-            # 临时存储待更新的集数，按集数数字排序
-            temp_episodes = []
-            for item in need_save_list:
-                if not item["dir"]:
-                    season, episode, full_episode = self.extract_season_episode_from_renamed(item["file_name_re"])
-                    if season and episode is not None:
-                        temp_episodes.append((season, episode, full_episode))
-            
-            # 按季数和集数升序排序
-            temp_episodes.sort(key=lambda x: (x[0], x[1]))
-            
-            # 更新记录，确保最新集数覆盖旧记录
-            for season, episode, full_episode in temp_episodes:
-                episode_records[season] = full_episode
-                print(f"更新集数记录: {full_episode}")
+                    break
 
-        # 建立目录树
+        # 建立目录树（关键修复：关联原始文件和新fid）
         for index, item in enumerate(need_save_list):
             icon = self._get_file_icon(item)
+            # 获取转存后的新fid（核心修复点）
+            new_fid = temp_save_fids[index] if index < len(temp_save_fids) else ""
             tree.create_node(
                 f"{icon}{item['file_name_re']}",
-                item["fid"],
+                f"{item['fid']}_{index}",  # 避免fid重复
                 parent=pdir_fid,
                 data={
                     "file_name": item["file_name"],
                     "file_name_re": item["file_name_re"],
-                    "fid": f"{save_as_top_fids[index]}",
+                    "old_fid": item["fid"],  # 原始分享fid
+                    "new_fid": new_fid,      # 转存后的新fid（用于重命名）
                     "path": f"{savepath}/{item['file_name_re']}",
                     "is_dir": item["dir"],
                     "obj_category": item.get("obj_category", ""),
@@ -971,17 +981,49 @@ class Quark:
         return tree
 
     def do_rename(self, tree, node_id=None):
+        """优化重命名逻辑，使用转存后的新fid"""
+        rename_success = True
         if node_id is None:
             node_id = tree.root
+        
         for child in tree.children(node_id):
-            file = child.data
-            if file.get("is_dir"):
-                pass  # 不递归重命名子目录
-            elif file.get("file_name_re") and file["file_name_re"] != file["file_name"]:
-                rename_ret = self.rename(file["fid"], file["file_name_re"])
-                print(f"重命名：{file['file_name']} → {file['file_name_re']}")
-                if rename_ret["code"] != 0:
-                    print(f"      ↑ 失败，{rename_ret['message']}")
+            file_data = child.data
+            if file_data.get("is_dir"):
+                # 递归处理子目录（如果需要）
+                self.do_rename(tree, child.identifier)
+            elif file_data.get("new_fid") and file_data["file_name_re"] != file_data["file_name"]:
+                # 使用转存后的新fid进行重命名
+                rename_ret = self.rename(file_data["new_fid"], file_data["file_name_re"])
+                if rename_ret["code"] == 0:
+                    print(f"重命名成功：{file_data['file_name']} → {file_data['file_name_re']}")
+                else:
+                    print(f"重命名失败：{file_data['file_name']} → {file_data['file_name_re']} | {rename_ret['message']}")
+                    rename_success = False
+        return rename_success
+
+    def update_episode_records(self, task, tree):
+        """重命名成功后更新集数记录"""
+        task_name = task["taskname"]
+        episode_records = CONFIG_DATA["saved_records"][task_name]
+        temp_episodes = []
+        
+        # 遍历目录树提取重命名后的文件信息
+        for node in tree.all_nodes():
+            if node.is_root():
+                continue
+            file_data = node.data
+            if not file_data.get("is_dir") and file_data.get("file_name_re"):
+                season, episode, full_episode = self.extract_season_episode_from_renamed(file_data["file_name_re"])
+                if season and episode is not None:
+                    temp_episodes.append((season, episode, full_episode))
+        
+        # 按季数和集数升序排序
+        temp_episodes.sort(key=lambda x: (x[0], x[1]))
+        
+        # 更新记录，确保最新集数覆盖旧记录
+        for season, episode, full_episode in temp_episodes:
+            episode_records[season] = full_episode
+            print(f"更新集数记录: {full_episode}")
 
     def _get_file_icon(self, f):
         if f.get("dir"):
